@@ -4,6 +4,7 @@ import com.acs.finance.db.Db;
 import com.acs.finance.dao.SessionDao;
 import com.acs.finance.dao.UserDao;
 import com.acs.finance.model.User;
+import com.acs.finance.util.Logger;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -21,19 +22,31 @@ public class AuthService {
 	private final SessionDao sessionDao = new SessionDao();
 
 	public User register(String username, String password) {
-		if (username == null || username.isBlank() || password == null || password.isBlank()) return null;
-		if (usersByName.containsKey(username)) return null;
+		if (username == null || username.isBlank() || password == null || password.isBlank()) {
+			Logger.warning("Registration attempt with empty username or password");
+			return null;
+		}
+		if (usersByName.containsKey(username)) {
+			Logger.warning("Registration failed: username already exists: %s", username);
+			return null;
+		}
 		String id;
 		String hash = hashPassword(password);
 		if (useDb) {
 			try {
 				id = userDao.insert(username, hash);
-			} catch (Exception e) { return null; }
+				Logger.debug("User registered in database: %s (id: %s)", username, id);
+			} catch (Exception e) {
+				Logger.error("Failed to register user in database: %s", e, username);
+				return null;
+			}
 		} else {
 			id = UUID.randomUUID().toString();
+			Logger.debug("User registered in memory: %s (id: %s)", username, id);
 		}
 		User u = new User(id, username, hash, null, 1.0);
 		usersByName.put(username, u);
+		Logger.info("User successfully registered: %s", username);
 		return u;
 	}
 
@@ -45,24 +58,55 @@ public class AuthService {
 				if (r != null) {
 					u = new User(r.id, r.username, r.passwordHash, r.groupId, r.share);
 					usersByName.put(u.username, u);
+					Logger.debug("User loaded from database: %s", username);
 				}
-			} catch (Exception ignored) {}
+			} catch (Exception e) {
+				Logger.error("Failed to load user from database: %s", e, username);
+			}
 		}
-		if (u == null) return null;
-		if (!verifyPassword(password, u.passwordHash)) return null;
+		if (u == null) {
+			Logger.warning("Login failed: user not found: %s", username);
+			return null;
+		}
+		if (!verifyPassword(password, u.passwordHash)) {
+			Logger.warning("Login failed: invalid password for user: %s", username);
+			return null;
+		}
+		Logger.debug("User authenticated: %s", username);
 		return u;
 	}
 
 	public String createSession(String username) {
 		String sid = genToken();
 		sessions.put(sid, username);
-		if (useDb) try { sessionDao.create(sid, username); } catch (Exception ignored) {}
+		if (useDb) {
+			try {
+				sessionDao.create(sid, username);
+				Logger.debug("Session created in database: %s", username);
+			} catch (Exception e) {
+				Logger.error("Failed to create session in database: %s", e, username);
+			}
+		}
+		Logger.debug("Session created: user=%s, sid=%s...", username, sid.substring(0, Math.min(8, sid.length())));
 		return sid;
 	}
 
 	public void destroySession(String sid) {
-		if (sid != null) sessions.remove(sid);
-		if (useDb && sid != null) try { sessionDao.delete(sid); } catch (Exception ignored) {}
+		if (sid != null) {
+			String username = sessions.get(sid);
+			sessions.remove(sid);
+			if (useDb) {
+				try {
+					sessionDao.delete(sid);
+					Logger.debug("Session deleted from database: %s", sid.substring(0, Math.min(8, sid.length())) + "...");
+				} catch (Exception e) {
+					Logger.error("Failed to delete session from database", e);
+				}
+			}
+			if (username != null) {
+				Logger.debug("Session destroyed: user=%s", username);
+			}
+		}
 	}
 
 	public User getUserBySession(String sid) {

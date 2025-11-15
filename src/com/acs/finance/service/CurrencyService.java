@@ -1,6 +1,7 @@
 package com.acs.finance.service;
 
 import com.acs.finance.model.CurrencyRates;
+import com.acs.finance.util.Logger;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
@@ -19,12 +20,24 @@ public class CurrencyService {
 
 	public CurrencyRates getRates() {
 		long now = System.currentTimeMillis();
-		if (cache != null && (now - cacheAt) < TTL_LATEST_MS) return cache;
+		if (cache != null && (now - cacheAt) < TTL_LATEST_MS) {
+			Logger.trace("Currency rates returned from cache");
+			return cache;
+		}
 		try {
+			Logger.debug("Fetching currency rates from external API");
 			CurrencyRates r = fetch();
-			if (r != null) { cache = r; cacheAt = now; return r; }
-		} catch (Exception ignored) {}
+			if (r != null) {
+				cache = r;
+				cacheAt = now;
+				Logger.info("Currency rates updated successfully: base=%s, currencies=%d", r.base, r.rates.size());
+				return r;
+			}
+		} catch (Exception e) {
+			Logger.error("Failed to fetch currency rates from external API", e);
+		}
 		// fallback stub
+		Logger.warning("Using fallback currency rates (stub data)");
 		Map<String, Double> stub = new HashMap<>();
 		stub.put("USD", 0.057); // ~ 1 MDL = 0.057 USD (example)
 		stub.put("EUR", 0.053);
@@ -64,13 +77,23 @@ public class CurrencyService {
 			Object[] cached = histCache.get(key);
 			long now = System.currentTimeMillis();
 			if (cached != null && now - (long)cached[0] < TTL_HISTORY_MS) {
+				Logger.trace("Currency history returned from cache: date=%s", date);
 				@SuppressWarnings("unchecked") Map<String, Double> m = (Map<String, Double>) cached[1];
 				return m;
 			}
+			Logger.debug("Fetching currency history from external API: date=%s, base=%s", date, base);
 			Map<String, Double> map = fetchRatesObject(url);
-			if (map != null) histCache.put(key, new Object[]{now, map});
+			if (map != null) {
+				histCache.put(key, new Object[]{now, map});
+				Logger.debug("Currency history fetched successfully: date=%s", date);
+			} else {
+				Logger.warning("Failed to fetch currency history: date=%s", date);
+			}
 			return map;
-		} catch (Exception ignored) { return null; }
+		} catch (Exception e) {
+			Logger.error("Error fetching currency history: date=%s", e, date);
+			return null;
+		}
 	}
 
 	public Map<String, Map<String, Double>> historyRange(String base, String symbol, String from, String to) {
@@ -80,21 +103,30 @@ public class CurrencyService {
 			Object[] cached = histCache.get(key);
 			long now = System.currentTimeMillis();
 			if (cached != null && now - (long)cached[0] < TTL_HISTORY_MS) {
+				Logger.trace("Currency history range returned from cache: from=%s, to=%s", from, to);
 				@SuppressWarnings("unchecked") Map<String, Map<String, Double>> m = (Map<String, Map<String, Double>>) cached[1];
 				return m;
 			}
+			Logger.debug("Fetching currency history range from external API: from=%s, to=%s, base=%s", from, to, base);
 			// fetch
 			HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
 			c.setConnectTimeout(4000);
 			c.setReadTimeout(4000);
 			c.setRequestMethod("GET");
 			if (c.getResponseCode() != 200) {
+				Logger.warning("Currency API returned non-200 status: %d, trying fallback", c.getResponseCode());
 				// try frankfurter if supported
 				if (supportsFrankfurter(base) && supportsFrankfurter(symbol)) {
+					Logger.debug("Trying Frankfurter API as fallback");
 					var ff = frankfurterRange(base, symbol, from, to);
-					if (ff != null) { histCache.put(key, new Object[]{now, ff}); return ff; }
+					if (ff != null) {
+						histCache.put(key, new Object[]{now, ff});
+						Logger.info("Currency history range fetched from Frankfurter API");
+						return ff;
+					}
 				}
 				// fallback: day-by-day fetch
+				Logger.debug("Using day-by-day fallback for currency history");
 				return fetchByDaysFallback(base, symbol, from, to, now, key);
 			}
 			try (BufferedReader br = new BufferedReader(new InputStreamReader(c.getInputStream(), StandardCharsets.UTF_8))) {

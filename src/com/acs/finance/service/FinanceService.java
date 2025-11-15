@@ -9,6 +9,7 @@ import com.acs.finance.model.Budget;
 import com.acs.finance.model.Goal;
 import com.acs.finance.model.Reminder;
 import com.acs.finance.model.Transaction;
+import com.acs.finance.util.Logger;
 
 import java.time.LocalDate;
 import java.util.*;
@@ -30,7 +31,13 @@ public class FinanceService {
 	public Transaction addTransaction(String userId, LocalDate date, String category, String description, double amount) {
 		String id;
 		if (useDb) {
-			try { id = txDao.insert(userId, date, category, description, amount); } catch (Exception e) { id = UUID.randomUUID().toString(); }
+			try {
+				id = txDao.insert(userId, date, category, description, amount);
+				Logger.debug("Transaction saved to database: userId=%s, amount=%.2f", userId, amount);
+			} catch (Exception e) {
+				Logger.error("Failed to save transaction to database", e);
+				id = UUID.randomUUID().toString();
+			}
 		} else {
 			id = UUID.randomUUID().toString();
 		}
@@ -38,10 +45,15 @@ public class FinanceService {
 		userTx.computeIfAbsent(userId, k -> new CopyOnWriteArrayList<>()).add(t);
 		if (category != null && amount < 0) {
 			if (useDb) {
-				try { budgetDao.addSpent(userId, category, -amount); } catch (Exception ignored) {}
+				try {
+					budgetDao.addSpent(userId, category, -amount);
+				} catch (Exception e) {
+					Logger.error("Failed to update budget spent in database", e);
+				}
 			}
 			Budget b = userBudgets.computeIfAbsent(userId, k -> new ConcurrentHashMap<>()).computeIfAbsent(category, c -> new Budget(userId, c, 0.0));
 			b.spent += -amount;
+			Logger.debug("Budget updated: userId=%s, category=%s, spent=%.2f", userId, category, b.spent);
 		}
 		return t;
 	}
@@ -81,17 +93,35 @@ public class FinanceService {
 		}
 		// if we didn't find in memory, still try to delete from DB
 		if (useDb) {
-			try { txDao.delete(txId, userId); } catch (Exception ignored) {}
+			try {
+				txDao.delete(txId, userId);
+				Logger.debug("Transaction deleted from database: txId=%s, userId=%s", txId, userId);
+			} catch (Exception e) {
+				Logger.error("Failed to delete transaction from database", e);
+			}
 		}
 		// adjust budget only if we know the deleted tx
 		if (removed != null && removed.amount < 0 && removed.category != null) {
 			Budget b = userBudgets.computeIfAbsent(userId, k -> new ConcurrentHashMap<>())
 				.computeIfAbsent(removed.category, c -> new Budget(userId, c, 0.0));
 			b.spent = Math.max(0, b.spent - (-removed.amount));
-			if (useDb) { try { budgetDao.addSpent(userId, removed.category, -(-removed.amount)); } catch (Exception ignored) {} }
+			if (useDb) {
+				try {
+					budgetDao.addSpent(userId, removed.category, -(-removed.amount));
+				} catch (Exception e) {
+					Logger.error("Failed to update budget after transaction deletion", e);
+				}
+			}
+			Logger.debug("Budget adjusted after transaction deletion: userId=%s, category=%s", userId, removed.category);
 		}
 		// if either removed in memory or attempted DB delete, consider it ok
-		return removed != null || useDb;
+		boolean result = removed != null || useDb;
+		if (result) {
+			Logger.debug("Transaction deleted: txId=%s, userId=%s", txId, userId);
+		} else {
+			Logger.warning("Transaction not found for deletion: txId=%s, userId=%s", txId, userId);
+		}
+		return result;
 	}
 
 	public Budget setBudget(String userId, String category, double limit) {

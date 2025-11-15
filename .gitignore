@@ -1,0 +1,20 @@
+# Compiled Java classes
+out/
+
+# Logs directory
+logs/
+
+# IDE files
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Node modules (if not needed in repo)
+# web/node_modules/
+

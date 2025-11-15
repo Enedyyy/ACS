@@ -11,6 +11,7 @@ import com.acs.finance.service.FinanceService;
 import com.acs.finance.service.AutoCategorizer;
 import com.acs.finance.service.GroupService;
 import com.acs.finance.service.SseHub;
+import com.acs.finance.util.Logger;
 import com.sun.net.httpserver.Headers;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
@@ -48,10 +49,13 @@ public class HttpServerApp {
 	}
 
 	public void start() throws IOException {
+		Logger.info("Initializing HTTP server on port %d", port);
 		server = HttpServer.create(new InetSocketAddress(port), 0);
 		// Thread pool for concurrent clients
-		executor = Executors.newFixedThreadPool(Math.max(4, Runtime.getRuntime().availableProcessors()));
+		int poolSize = Math.max(4, Runtime.getRuntime().availableProcessors());
+		executor = Executors.newFixedThreadPool(poolSize);
 		server.setExecutor(executor);
+		Logger.debug("Thread pool size: %d", poolSize);
 
 		// Static files
 		server.createContext("/", new StaticHandler("web/public"));
@@ -76,16 +80,29 @@ public class HttpServerApp {
 		});
 
 		server.start();
-		System.out.println("DB mode: " + (Db.isConfigured()?"ON":"OFF"));
+		boolean dbMode = Db.isConfigured();
+		Logger.info("DB mode: %s", dbMode ? "ON" : "OFF");
 
 		// periodic reminders tick
 		scheduler = java.util.concurrent.Executors.newSingleThreadScheduledExecutor();
 		scheduler.scheduleAtFixedRate(this::tick, 10, 10, java.util.concurrent.TimeUnit.SECONDS);
+		Logger.info("Scheduled reminders ticker started (every 10 seconds)");
 	}
 
 	public void stop() {
-		if (server != null) server.stop(0);
-		if (executor != null) executor.shutdownNow();
+		Logger.info("Stopping HTTP server...");
+		if (server != null) {
+			server.stop(0);
+			Logger.debug("HTTP server stopped");
+		}
+		if (executor != null) {
+			executor.shutdownNow();
+			Logger.debug("Executor service shut down");
+		}
+		if (scheduler != null) {
+			scheduler.shutdownNow();
+			Logger.debug("Scheduler shut down");
+		}
 	}
 
 	private static void setCommonHeaders(Headers headers) {
@@ -149,11 +166,14 @@ public class HttpServerApp {
 			exchange.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
 			String method = exchange.getRequestMethod();
 			String path = exchange.getRequestURI().getPath();
+			String remoteAddr = exchange.getRemoteAddress() != null ? exchange.getRemoteAddress().getAddress().getHostAddress() : "unknown";
 			Map<String, String> query = parseQuery(exchange.getRequestURI().getRawQuery());
 			String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
 			Map<String, String> form = method.equalsIgnoreCase("GET") ? new HashMap<>() : parseForm(body);
 
+			int statusCode = 200;
 			try {
+				Logger.debug("API request: %s %s from %s", method, path, remoteAddr);
 				if (path.equals("/api/register") && method.equals("POST")) { handleRegister(exchange, form); return; }
 				if (path.equals("/api/login") && method.equals("POST")) { handleLogin(exchange, form); return; }
 				if (path.equals("/api/logout") && method.equals("POST")) { handleLogout(exchange); return; }
@@ -182,33 +202,58 @@ public class HttpServerApp {
 				if (path.equals("/api/group/leave") && method.equals("POST")) { requireAuth(exchange); handleGroupLeave(exchange); return; }
 				if (path.equals("/api/group/me") && method.equals("GET")) { requireAuth(exchange); handleGroupMe(exchange); return; }
 				if (path.equals("/api/credit/history") && method.equals("GET")) { requireAuth(exchange); handleCreditHistory(exchange); return; }
+				statusCode = 404;
 				writeJson(exchange, 404, jsonMsg("error","not_found"));
 			} catch (UnauthorizedException ue) {
+				statusCode = 401;
+				Logger.warning("Unauthorized access attempt: %s %s from %s", method, path, remoteAddr);
 				writeJson(exchange, 401, jsonMsg("error","unauthorized"));
 			} catch (Exception e) {
+				statusCode = 500;
+				Logger.error("Error handling request %s %s from %s", e, method, path, remoteAddr);
 				writeJson(exchange, 500, jsonMsg("error","server_error"));
+			} finally {
+				if (statusCode >= 400) {
+					Logger.debug("API response: %s %s -> %d", method, path, statusCode);
+				}
 			}
 		}
 
 		private void handleRegister(HttpExchange ex, Map<String,String> form) throws IOException {
-			var u = auth.register(form.get("username"), form.get("password"));
-			if (u == null) { writeJson(ex, 400, jsonMsg("ok", false, "error", "user_exists_or_bad")); return; }
+			String username = form.get("username");
+			var u = auth.register(username, form.get("password"));
+			if (u == null) {
+				Logger.warning("Registration failed for username: %s", username);
+				writeJson(ex, 400, jsonMsg("ok", false, "error", "user_exists_or_bad"));
+				return;
+			}
+			Logger.info("User registered: %s (id: %s)", username, u.id);
 			writeJson(ex, 200, jsonMsg("ok", true));
 		}
 
 		private void handleLogin(HttpExchange ex, Map<String,String> form) throws IOException {
-			var u = auth.login(form.get("username"), form.get("password"));
-			if (u == null) { writeJson(ex, 400, jsonMsg("ok", false, "error", "bad_credentials")); return; }
+			String username = form.get("username");
+			var u = auth.login(username, form.get("password"));
+			if (u == null) {
+				Logger.warning("Login failed for username: %s", username);
+				writeJson(ex, 400, jsonMsg("ok", false, "error", "bad_credentials"));
+				return;
+			}
 			String sid = auth.createSession(u.username);
 			ex.getResponseHeaders().add("Set-Cookie", "SID="+sid+"; HttpOnly; Path=/");
+			Logger.info("User logged in: %s (id: %s, session: %s)", username, u.id, sid.substring(0, Math.min(8, sid.length())) + "...");
 			String json = "{\"ok\":true,\"user\":{\"id\":\""+u.id+"\",\"username\":\""+escapeJson(u.username)+"\"}}";
 			writeRaw(ex, 200, json);
 		}
 
 		private void handleLogout(HttpExchange ex) throws IOException {
 			String sid = sessionId(ex);
+			var u = user(ex);
 			auth.destroySession(sid);
 			ex.getResponseHeaders().add("Set-Cookie", "SID=; Max-Age=0; Path=/");
+			if (u != null) {
+				Logger.info("User logged out: %s", u.username);
+			}
 			writeJson(ex, 200, jsonMsg("ok", true));
 		}
 
@@ -227,12 +272,14 @@ public class HttpServerApp {
 			String desc = emptyToNull(form.get("description"));
 			if (cat == null) cat = categorizer.categorize(desc);
 			Transaction t = finance.addTransaction(u.id, date, cat, desc, amount);
+			Logger.info("Transaction added: user=%s, amount=%.2f, category=%s, date=%s", u.username, amount, cat, date);
 			sse.send(sessionId(ex), "{\"type\":\"tx-added\"}");
 			sse.send(sessionId(ex), "{\"type\":\"budget-update\"}");
 			// Alerts: budget exceed
 			if (cat != null) {
 				for (Budget b : finance.getBudgets(u.id)) {
 					if (b.category.equalsIgnoreCase(cat) && b.limit>0 && b.spent> b.limit) {
+						Logger.warning("Budget exceeded: user=%s, category=%s, limit=%.2f, spent=%.2f", u.username, cat, b.limit, b.spent);
 						sse.send(sessionId(ex), "{\"type\":\"alert\",\"message\":\"Превышен бюджет по категории '"+escapeJson(cat)+"'\"}");
 						break;
 					}
@@ -240,6 +287,7 @@ public class HttpServerApp {
 			}
 			// Anomaly detection
 			if (finance.isAnomalousExpense(u.id, cat, amount)) {
+				Logger.warning("Anomalous expense detected: user=%s, category=%s, amount=%.2f", u.username, cat, amount);
 				sse.send(sessionId(ex), "{\"type\":\"alert\",\"message\":\"Аномально высокая трата\"}");
 			}
 			writeJson(ex, 200, jsonMsg("ok", true, "id", t.id));
@@ -638,7 +686,9 @@ public class HttpServerApp {
 		setCommonHeaders(ex.getResponseHeaders());
 		ex.getResponseHeaders().set("Cache-Control", "no-store");
 		String sid = new ApiHandler().sessionId(ex);
-		if (sid == null || auth.getUserBySession(sid) == null) {
+		var u = sid != null ? auth.getUserBySession(sid) : null;
+		if (sid == null || u == null) {
+			Logger.warning("SSE connection rejected: unauthorized");
 			ex.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
 			byte[] b = jsonMsg("error","unauthorized").getBytes(StandardCharsets.UTF_8);
 			ex.sendResponseHeaders(401, b.length);
@@ -647,11 +697,15 @@ public class HttpServerApp {
 		}
 		try {
 			sse.register(sid, ex);
-		} catch (IOException ignored) {}
+			Logger.info("SSE connection established: user=%s, session=%s", u.username, sid.substring(0, Math.min(8, sid.length())) + "...");
+		} catch (IOException e) {
+			Logger.error("Failed to register SSE connection", e);
+		}
 	}
 
 	private void tick() {
 		long today = java.time.LocalDate.now().toEpochDay();
+		int remindersSent = 0;
 		for (String sid : sse.sessionIds()) {
 			var u = auth.getUserBySession(sid);
 			if (u == null) continue;
@@ -659,7 +713,12 @@ public class HttpServerApp {
 			for (var r : due) {
 				String msg = r.message + (r.amount!=null? (" ("+FinanceService.round2(r.amount)+")") : "");
 				sse.send(sid, "{\"type\":\"reminder\",\"message\":\""+escapeJson(msg)+"\"}");
+				remindersSent++;
+				Logger.debug("Reminder sent: user=%s, message=%s", u.username, r.message);
 			}
+		}
+		if (remindersSent > 0) {
+			Logger.info("Reminders tick: %d reminders sent", remindersSent);
 		}
 	}
 

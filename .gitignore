@@ -16,8 +16,8 @@ logs/
 .DS_Store
 Thumbs.db
 
-# Node modules (if not needed in repo)
-# web/node_modules/
+# Node modules
+web/node_modules/
 
 # SQLite database
 data/*.db

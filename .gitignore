@@ -1,5 +1,6 @@
 # Compiled Java classes
 out/
+target/
 
 # Logs directory
 logs/
@@ -17,4 +18,19 @@ Thumbs.db
 
 # Node modules (if not needed in repo)
 # web/node_modules/
+
+# SQLite database
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+
+# Maven
+target/
+*.jar
+!.mvn/wrapper/maven-wrapper.jar
+
+# Spring Boot
+*.log
+application-local.properties
 
